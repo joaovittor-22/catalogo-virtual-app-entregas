@@ -18,8 +18,15 @@ moto no mapa pelo link do pedido.
    a posição.
 4. **Concluir** — a menos de 150 m do endereço aparece **Concluir entrega**.
    Antes disso há a saída **Já entreguei o pedido**, com confirmação, para
-   quando o GPS falha ou o endereço não foi localizado. Concluir para o
+   quando o GPS falha ou o endereço não foi localizado. A confirmação aceita
+   uma observação opcional para a loja (com toques rápidos). Concluir para o
    rastreio e devolve o entregador à fila.
+5. **Devolver** — **Não consegui entregar** pede o motivo, obrigatório (com
+   toques rápidos como _Cliente ausente_); a loja vê o motivo no pedido.
+
+Se outro entregador pegou o pedido antes, ou a loja o cancelou, **Iniciar rota**
+avisa em linguagem simples e tira o cartão da fila; com uma corrida já em
+andamento, o app abre nela.
 
 Uma entrega por vez: com uma em andamento, o app abre direto nela.
 
@@ -149,18 +156,55 @@ barreira.
 - O rastreio continua com o app em segundo plano (o entregador abre o
   navegador de mapas): no Android por um serviço com notificação visível, no
   iOS com o indicador azul do sistema. Com o app fechado, nada é enviado.
-- O aparelho só gera leitura a cada 8 m percorridos, e as posições saem em
-  lote a cada 3 s. Sem rede, ficam guardadas e seguem quando ela volta.
+- O aparelho só gera leitura a cada 8 m percorridos: parado, nada é lido nem
+  enviado.
+- As posições saem em lote, de tempos em tempos conforme a distância até o
+  cliente (RNF-E05): a cada **3 s** a menos de 1 km (o cliente está olhando a
+  chegada), **6 s** até 3 km e **10 s** mais longe. Cada envio a menos é uma vez
+  a menos que o rádio do celular acorda. O mapa do cliente só avisa "sem sinal"
+  depois de 60 s.
+- Sem rede, as posições ficam guardadas (até 600) e as tentativas se espaçam:
+  a espera dobra a cada falha, até 30 s, com parte sorteada para os aparelhos
+  não voltarem todos juntos. Quando qualquer outra chamada do app tem resposta,
+  o que estava guardado sai na hora.
+- A conferência de 25 s (a loja encerrou a corrida?) só roda quando nenhum lote
+  chegou à API nesse tempo: a resposta de cada lote já diz se a corrida segue.
+
+## Conexão instável
+
+O entregador está na rua e a rede cai (RF-E12):
+
+- **Fila e corrida guardadas.** A última fila e a corrida em andamento ficam no
+  Keystore/Keychain (têm nome e endereço de cliente), separadas por loja e
+  entregador, por até 12 h. Sem rede, a fila abre com a lista guardada e a hora
+  dela; a corrida abre com endereço, itens e troco. Gravar só acontece quando o
+  conteúdo muda.
+- **Ações guardadas.** Concluir, devolver e enviar ou remover a foto do
+  comprovante funcionam sem rede: ficam numa lista no aparelho, com a hora em
+  que aconteceram (`ocorridaEm`), e seguem para a API **na ordem** quando a
+  rede volta, ao voltar ao app, a cada atualização da fila ou depois da espera
+  crescente. A lista sobrevive ao app fechado e à sessão expirada (sai depois
+  do novo login). Repetir é seguro: concluir é idempotente na API, e uma
+  devolução repetida é conferida antes de virar aviso.
+- **Recusa da API** ao reenviar (a loja encerrou antes, por exemplo) tira a ação
+  da lista e avisa o entregador.
+- **Iniciar rota precisa de rede**: dois entregadores podem tocar no mesmo
+  pedido, então não dá para guardar para depois. Com uma entrega ainda por
+  enviar, o app pede para esperar a conexão.
+- **Sair** pelo botão apaga a fila, a corrida e as ações guardadas; com algo por
+  enviar, pede confirmação antes.
 
 ## Organização
 
 ```
 lib/
-  core/      API, configuração, geometria, formatação, tema, acesso ao GPS
+  core/      API, configuração, geometria, formatação, tema, acesso ao GPS,
+             armazenamento no aparelho, espera entre tentativas
   auth/      sessão (guardada no Keystore/Keychain), login
   fila/      pedidos prontos, distâncias, "Iniciar rota"
-  corrida/   entrega em andamento, filtro de GPS, rastreador, rotas (OSRM)
-test/        filtro, geometria, rastreador e telas, com API e GPS falsos
+  corrida/   entrega em andamento, filtro de GPS, rastreador, rotas (OSRM),
+             ações guardadas sem rede (pendencias.dart)
+test/        filtro, geometria, rastreador, ações sem rede e telas, com API e GPS falsos
 ```
 
 ## O que ainda não foi feito
@@ -169,8 +213,6 @@ test/        filtro, geometria, rastreador e telas, com API e GPS falsos
   build do APK de debug. Comportamento do GPS em campo e a notificação do
   serviço em segundo plano precisam de teste na rua.
 - Ícone, nome de pacote definitivo, assinatura e publicação nas lojas.
-- Ações feitas sem rede (concluir, devolver) não são enfileiradas: o app avisa
-  e o entregador toca de novo. Só as posições são guardadas para reenvio.
 
 ## Termos de uso
 

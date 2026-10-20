@@ -2,12 +2,15 @@ import 'package:flutter/material.dart';
 
 import '../auth/auth_controller.dart';
 import '../core/api_client.dart';
+import '../core/armazem.dart';
 import '../core/formato.dart';
 import '../core/localizacao.dart';
 import '../core/tema.dart';
 import '../corrida/corrida.dart';
 import '../corrida/corrida_controller.dart';
 import '../corrida/corrida_page.dart';
+import '../corrida/dialogos.dart';
+import '../corrida/pendencias.dart';
 import '../conta/conta_page.dart';
 import '../corrida/rota_service.dart';
 import 'fila_controller.dart';
@@ -33,12 +36,17 @@ class FilaPage extends StatefulWidget {
 }
 
 class _FilaPageState extends State<FilaPage> with WidgetsBindingObserver {
+  late final DadosLocais _dados = DadosLocais(widget.auth.armazem, widget.auth.sessao?.dono ?? '');
+  late final Pendencias _pendencias = Pendencias(api: widget.api, dados: _dados);
   late final FilaController _fila = FilaController(
     api: widget.api,
     localizacao: widget.localizacao,
     rotas: widget.rotas,
+    dados: _dados,
+    pendencias: _pendencias,
   );
   bool _naCorrida = false;
+  bool _tinhaPendencias = false;
 
   /// Entrega em andamento. Fica viva fora da tela dela: o entregador pode
   /// voltar a fila e o rastreio continua ate concluir ou devolver.
@@ -49,23 +57,79 @@ class _FilaPageState extends State<FilaPage> with WidgetsBindingObserver {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _fila.addListener(_abrirCorridaAtiva);
-    _fila.comecar();
+    _pendencias.addListener(_aoMudarPendencias);
+    // A fila espera as pendencias: a corrida concluida sem rede nao reabre.
+    _pendencias.carregar().whenComplete(() {
+      if (mounted) _fila.comecar();
+    });
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _fila.removeListener(_abrirCorridaAtiva);
+    _pendencias.removeListener(_aoMudarPendencias);
     _fila.dispose();
     _encerrarCorrida();
+    _pendencias.dispose();
     super.dispose();
   }
 
-  /// Com o app em segundo plano a fila para de consultar a API.
+  /// Com o app em segundo plano a fila para de consultar a API. De volta ao
+  /// app, o que ficou guardado sem rede tenta sair na hora.
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) _pendencias.enviar();
     if (_naCorrida) return;
     state == AppLifecycleState.resumed ? _fila.comecar() : _fila.pausar();
+  }
+
+  /// RF-E12: avisa o que a API recusou ao reenviar e, quando tudo chegou,
+  /// atualiza a fila (o entregador pode estar livre para outra).
+  void _aoMudarPendencias() {
+    if (!mounted) return;
+    for (final aviso in _pendencias.tirarAvisos()) {
+      _avisar(aviso);
+    }
+    final esvaziou = _tinhaPendencias && _pendencias.vazia;
+    _tinhaPendencias = !_pendencias.vazia;
+    setState(() {});
+    if (esvaziou && !_naCorrida) {
+      _avisar('Tudo o que você fez sem internet chegou à loja.');
+      _fila.carregar();
+    }
+  }
+
+  /// Sair apaga do aparelho o que ainda nao foi enviado: confirma antes.
+  Future<void> _sair() async {
+    if (!_pendencias.vazia) {
+      final sair = await showDialog<bool>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text('Sair sem enviar?'),
+          content: Text(
+            _pendencias.acoes.length == 1
+                ? 'Uma ação feita sem internet ainda não chegou à loja. Se sair agora, ela '
+                      'se perde.'
+                : '${_pendencias.acoes.length} ações feitas sem internet ainda não chegaram à '
+                      'loja. Se sair agora, elas se perdem.',
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Ficar')),
+            FilledButton(
+              style: FilledButton.styleFrom(
+                backgroundColor: Cores.perigo,
+                minimumSize: const Size(120, 48),
+              ),
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('Sair mesmo assim'),
+            ),
+          ],
+        ),
+      );
+      if (sair != true) return;
+    }
+    await widget.auth.sairDoAparelho();
   }
 
   /// RF-E04: com corrida em andamento o app abre direto nela.
@@ -97,7 +161,8 @@ class _FilaPageState extends State<FilaPage> with WidgetsBindingObserver {
       final corrida = await _fila.iniciarRota(pedido);
       if (mounted) await _abrirCorrida(corrida);
     } on ApiException catch (e) {
-      // "Ja foi pego por outro entregador" e informacao, nao erro cru.
+      // "Ja foi pego por outro entregador" e informacao, nao erro cru: o
+      // pedido ja saiu da lista e o aviso diz para escolher outro.
       if (mounted) _avisar(e.mensagem);
     }
   }
@@ -109,6 +174,7 @@ class _FilaPageState extends State<FilaPage> with WidgetsBindingObserver {
       localizacao: widget.localizacao,
       rotas: widget.rotas,
       corrida: corrida,
+      pendencias: _pendencias,
     );
     _corrida = controller..addListener(_conferirCorrida);
     await _mostrarCorrida(controller);
@@ -132,7 +198,7 @@ class _FilaPageState extends State<FilaPage> with WidgetsBindingObserver {
       _encerrarCorrida();
       _avisar(mensagem);
       // Entrega encerrada: o entregador esta livre para escolher a proxima.
-      _fila.corridaAtivaId = null;
+      _fila.esquecerCorrida();
     }
     setState(() {});
     _fila.comecar();
@@ -143,44 +209,34 @@ class _FilaPageState extends State<FilaPage> with WidgetsBindingObserver {
   Future<void> _concluirPelaFila() async {
     final ativa = _corrida;
     if (ativa == null || ativa.enviando) return;
-    final distanciaM = ativa.distanciaAoDestinoM;
-    final longe = !ativa.pertoDoDestino;
-    final confirmou = await showDialog<bool>(
+    final observacao = await showDialog<String>(
       context: context,
-      builder: (context) => AlertDialog(
-        title: Text('Concluir a entrega #${ativa.corrida.numero}?'),
-        content: Text(
-          !longe
-              ? 'Entrega para ${ativa.corrida.clienteNome}.'
-              : distanciaM == null
-              ? 'Não foi possível confirmar pelo GPS que você chegou ao endereço. '
-                    'Conclua só se o pedido já foi entregue.'
-              : 'Você ainda está a ${distancia(distanciaM)} do endereço. '
-                    'Conclua só se o pedido já foi entregue.',
-        ),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Voltar')),
-          FilledButton(
-            style: FilledButton.styleFrom(minimumSize: const Size(120, 48)),
-            onPressed: () => Navigator.pop(context, true),
-            child: Text(longe ? 'Já entreguei' : 'Concluir'),
-          ),
-        ],
+      builder: (_) => DialogoDeConclusao(
+        numero: ativa.corrida.numero,
+        clienteNome: ativa.corrida.clienteNome,
+        longe: !ativa.pertoDoDestino,
+        distanciaM: ativa.distanciaAoDestinoM,
       ),
     );
-    if (confirmou != true || !mounted) return;
+    if (observacao == null || !mounted) return;
     try {
-      await ativa.concluir();
+      await ativa.concluir(observacao: observacao);
     } on ApiException catch (e) {
-      // Rede caiu: a entrega segue aberta, e so tocar de novo.
+      // Recusa da API: a entrega segue aberta, com o motivo. Sem rede, a
+      // conclusao fica guardada e nao chega aqui.
       if (mounted) _avisar(e.mensagem);
       return;
     }
+    final guardada = ativa.guardadaParaEnviar;
     _encerrarCorrida();
-    _fila.corridaAtivaId = null;
+    _fila.esquecerCorrida();
     if (!mounted) return;
     setState(() {});
-    _avisar('Entrega concluída. Escolha a próxima.');
+    _avisar(
+      guardada
+          ? CorridaPage.guardada('Entrega concluída')
+          : 'Entrega concluída. Escolha a próxima.',
+    );
     _fila.carregar();
   }
 
@@ -188,7 +244,7 @@ class _FilaPageState extends State<FilaPage> with WidgetsBindingObserver {
   void _conferirCorrida() {
     if (_naCorrida || !(_corrida?.encerradaPelaLoja ?? false)) return;
     _encerrarCorrida();
-    _fila.corridaAtivaId = null;
+    _fila.esquecerCorrida();
     if (!mounted) return;
     setState(() {});
     _avisar('A loja encerrou esta entrega.');
@@ -247,7 +303,7 @@ class _FilaPageState extends State<FilaPage> with WidgetsBindingObserver {
               ),
             ),
           ),
-          IconButton(tooltip: 'Sair', icon: const Icon(Icons.logout), onPressed: widget.auth.sair),
+          IconButton(tooltip: 'Sair', icon: const Icon(Icons.logout), onPressed: _sair),
         ],
       ),
       body: ListenableBuilder(
@@ -267,8 +323,23 @@ class _FilaPageState extends State<FilaPage> with WidgetsBindingObserver {
                     aoAbrir: _reabrirCorrida,
                     aoConcluir: _concluirPelaFila,
                   ),
+                if (!_pendencias.vazia)
+                  _Aviso(
+                    icone: Icons.cloud_upload_outlined,
+                    texto: _pendencias.acoes.length == 1
+                        ? 'Uma ação feita sem internet vai chegar à loja assim que a conexão '
+                              'voltar.'
+                        : '${_pendencias.acoes.length} ações feitas sem internet vão chegar à '
+                              'loja assim que a conexão voltar.',
+                  ),
                 if (_fila.erro != null)
-                  _Aviso(icone: Icons.wifi_off, texto: '${_fila.erro} Mostrando a última lista.'),
+                  _Aviso(
+                    icone: Icons.wifi_off,
+                    texto: switch (_fila.atualizadaEm) {
+                      null => _fila.erro!,
+                      final em => '${_fila.erro} Mostrando a lista das ${hora(em)}.',
+                    },
+                  ),
                 if (_fila.permissao != Permissao.concedida && _fila.itens.isNotEmpty)
                   _Aviso(
                     icone: Icons.my_location,

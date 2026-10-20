@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 
 import 'config.dart';
@@ -24,6 +25,10 @@ class ApiException implements Exception {
 
   /// Outro ja fez (ex.: pedido pego por outro entregador).
   bool get conflito => status == 409;
+
+  /// Vale tentar de novo mais tarde, com a mesma requisicao: sem rede, API fora do ar ou
+  /// pedindo calma. Os demais erros sao resposta definitiva.
+  bool get passageiro => semConexao || status == 408 || status == 429 || (status ?? 0) >= 500;
 
   @override
   String toString() => mensagem;
@@ -48,6 +53,11 @@ class ApiClient {
   /// Chamado quando os termos de uso mudam com a sessão aberta: é preciso entrar de novo e
   /// marcar o aceite.
   void Function()? aoExigirTermos;
+
+  /// Falso desde a última chamada que ficou sem resposta; volta a verdadeiro na primeira
+  /// resposta do servidor, qualquer que seja o status. Quem tem algo guardado para enviar
+  /// ouve a volta e tenta na hora, sem esperar o próprio temporizador.
+  final ValueNotifier<bool> conectado = ValueNotifier(true);
 
   Future<dynamic> get(String caminho) => _enviar('GET', caminho);
 
@@ -82,12 +92,16 @@ class ApiClient {
     try {
       resposta = await http.Response.fromStream(await _http.send(requisicao).timeout(_tempoLimite));
     } on TimeoutException {
+      conectado.value = false;
       throw const ApiException('O servidor demorou para responder. Tente de novo.');
     } on SocketException {
+      conectado.value = false;
       throw const ApiException('Sem conexão com a internet.');
     } on http.ClientException {
+      conectado.value = false;
       throw const ApiException('Sem conexão com a internet.');
     }
+    conectado.value = true;
 
     final texto = utf8.decode(resposta.bodyBytes);
     final dados = texto.isEmpty ? null : _decodificar(texto);

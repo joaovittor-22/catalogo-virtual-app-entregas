@@ -6,6 +6,7 @@ class Sessao {
     required this.entregadorCodigo,
     required this.lojaNome,
     required this.expiraEm,
+    this.lojaCodigo = '',
   });
 
   final String token;
@@ -14,7 +15,15 @@ class Sessao {
   final String lojaNome;
   final DateTime expiraEm;
 
+  /// Codigo da empresa que o entregador digita no login.
+  final String lojaCodigo;
+
   bool get expirada => DateTime.now().isAfter(expiraEm);
+
+  /// A quem pertence o que fica guardado no aparelho (fila, corrida, acoes por
+  /// enviar). Nao muda quando o token e renovado: depois de entrar de novo, o
+  /// que ficou pendente segue para a API.
+  String get dono => '$lojaCodigo/$entregadorCodigo';
 
   factory Sessao.daResposta(Map<String, dynamic> json) {
     final entregador = json['entregador'] as Map<String, dynamic>;
@@ -24,6 +33,7 @@ class Sessao {
       entregadorNome: entregador['nome'] as String? ?? '',
       entregadorCodigo: entregador['codigo'] as String? ?? '',
       lojaNome: loja['nome'] as String? ?? '',
+      lojaCodigo: loja['codigo'] as String? ?? loja['slug'] as String? ?? '',
       expiraEm: DateTime.now().add(Duration(milliseconds: (json['expiraEmMs'] as num).toInt())),
     );
   }
@@ -33,6 +43,7 @@ class Sessao {
     'entregadorNome': entregadorNome,
     'entregadorCodigo': entregadorCodigo,
     'lojaNome': lojaNome,
+    'lojaCodigo': lojaCodigo,
     'expiraEm': expiraEm.toIso8601String(),
   };
 
@@ -41,6 +52,7 @@ class Sessao {
     entregadorNome: json['entregadorNome'] as String? ?? '',
     entregadorCodigo: json['entregadorCodigo'] as String? ?? '',
     lojaNome: json['lojaNome'] as String? ?? '',
+    lojaCodigo: json['lojaCodigo'] as String? ?? '',
     expiraEm: DateTime.parse(json['expiraEm'] as String),
   );
 }

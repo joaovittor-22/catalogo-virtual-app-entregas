@@ -144,7 +144,13 @@ void main() {
       api.responder = (c) {
         if (c.caminho.endsWith('/iniciar-rota')) {
           pedidos = [pedidos[0]];
-          return (409, {'message': 'Este pedido ja foi pego por outro entregador.'});
+          return (
+            409,
+            {
+              'message': 'Este pedido ja foi pego por outro entregador.',
+              'codigo': 'PEDIDO_JA_PEGO',
+            },
+          );
         }
         return (200, {'corridaAtivaId': null, 'loja': null, 'pedidos': pedidos});
       };
@@ -175,13 +181,88 @@ void main() {
 
       await tester.tap(find.descendant(of: cartaoDaBia, matching: find.text('Iniciar rota')));
       await _assentar(tester);
-      expect(find.text('Este pedido ja foi pego por outro entregador.'), findsOneWidget);
+      // RF-E03: estado da fila, em linguagem de gente, e o pedido sai da lista.
+      expect(
+        find.text('Outro entregador já pegou o pedido #PED2. Escolha outro da fila.'),
+        findsOneWidget,
+      );
       expect(find.text('Bia Perto'), findsNothing);
       expect(find.text('Ana Longe'), findsOneWidget);
       // Sobrou um pedido: nao ha o que comparar.
       expect(find.text('Mais próximo'), findsNothing);
 
       await tester.pumpWidget(const SizedBox());
+    });
+
+    testWidgets('RF-E03: pedido que saiu da fila ou corrida ja ativa nao viram erro tecnico', (
+      tester,
+    ) async {
+      final api = ApiFalsa();
+      final auth = AuthController(api.cliente, CofreFalso());
+      await auth.restaurar();
+      int? corridaAtivaId;
+      var anaCancelada = false;
+      api.responder = (c) {
+        if (c.caminho.endsWith('/1/iniciar-rota')) {
+          anaCancelada = true;
+          return (404, {'message': 'Pedido nao encontrado.'});
+        }
+        if (c.caminho.endsWith('/2/iniciar-rota')) {
+          corridaAtivaId = 3;
+          return (
+            409,
+            {'message': 'Voce ja tem uma entrega em andamento.', 'codigo': 'CORRIDA_ATIVA'},
+          );
+        }
+        if (c.caminho.endsWith('/corrida')) return (200, corridaJson());
+        return (
+          200,
+          {
+            'corridaAtivaId': corridaAtivaId,
+            'loja': null,
+            'pedidos': [
+              if (!anaCancelada) pedido(1, 'Ana Cancelada', -16.70, -49.28),
+              pedido(2, 'Bia', -16.681, -49.251),
+            ],
+          },
+        );
+      };
+
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: temaDoApp(),
+          home: FilaPage(
+            auth: auth,
+            api: api.cliente,
+            localizacao: LocalizacaoFalsa(permissao: Permissao.bloqueada),
+            rotas: rotasFalsas(const [], fora: true),
+          ),
+        ),
+      );
+      await _assentar(tester);
+
+      // A loja cancelou o pedido da Ana: sai da lista, com o aviso.
+      final cartaoDaAna = find.ancestor(
+        of: find.text('Ana Cancelada'),
+        matching: find.byType(Card),
+      );
+      await tester.tap(find.descendant(of: cartaoDaAna, matching: find.text('Iniciar rota')));
+      await _assentar(tester);
+      expect(
+        find.text('O pedido #PED1 não está mais disponível. Escolha outro da fila.'),
+        findsOneWidget,
+      );
+      expect(find.text('Ana Cancelada'), findsNothing);
+
+      // Ja ha corrida em andamento (outro aparelho): avisa e abre a corrida, sem
+      // tirar a Bia da fila por engano.
+      await tester.tap(find.text('Iniciar rota'));
+      await _assentar(tester);
+      await _assentar(tester);
+      expect(find.text('Entrega #K7M2P9'), findsOneWidget);
+
+      await tester.pumpWidget(const SizedBox());
+      await tester.pump(const Duration(seconds: 1));
     });
 
     testWidgets('sem localizacao mede a partir da loja e oferece ativar', (tester) async {
@@ -293,10 +374,19 @@ void main() {
       await tester.tap(find.byKey(const Key('concluir')));
       await _assentar(tester);
 
+      // RF-E08: confirma, com observacao opcional para a loja (toque rapido ou texto).
+      expect(find.text('Concluir a entrega #K7M2P9?'), findsOneWidget);
+      await tester.tap(find.text('Entregue na portaria'));
+      await tester.pump();
+      expect(find.widgetWithText(TextField, 'Entregue na portaria'), findsOneWidget);
+      await tester.tap(find.text('Concluir'));
+      await _assentar(tester);
+
       // Enviou o que faltava, concluiu e voltou para a fila.
       expect(api.para('/posicoes'), isNotEmpty);
       final conclusao = api.para('/concluir').single;
       expect(conclusao.corpo['latitude'], closeTo(-16.6805, 0.001));
+      expect(conclusao.corpo['observacao'], 'Entregue na portaria');
       expect(mensagemAoSair, 'Entrega concluída. Escolha a próxima.');
       expect(find.text('abrir'), findsOneWidget);
       // O rastreio parou: leitura nova nao gera envio.
@@ -346,19 +436,34 @@ void main() {
       await tester.tap(find.text('Não consegui entregar'));
       await _assentar(tester);
 
-      await tester.tap(find.text('Devolver pedido'));
-      await _assentar(tester);
+      // Sem motivo o botao fica apagado e avisa que e obrigatorio.
+      FilledButton devolver() =>
+          tester.widget<FilledButton>(find.widgetWithText(FilledButton, 'Devolver pedido'));
+      expect(devolver().onPressed, isNull);
+      expect(find.textContaining('Obrigatório. A loja vê este motivo'), findsOneWidget);
+      await tester.enterText(find.byKey(const Key('motivo')), '   ');
+      await tester.pump();
+      expect(devolver().onPressed, isNull);
       expect(api.para('/devolver'), isEmpty);
 
-      await tester.enterText(find.byType(TextField), 'cliente ausente');
+      // Um toque preenche; o texto continua editavel.
+      await tester.tap(find.text('Cliente ausente'));
+      await tester.pump();
+      await tester.enterText(find.byKey(const Key('motivo')), 'Cliente ausente, interfone mudo');
+      await tester.pump();
       await tester.tap(find.text('Devolver pedido'));
       await _assentar(tester);
-      expect(api.para('/devolver').single.corpo, {'motivo': 'cliente ausente'});
+      final corpo = api.para('/devolver').single.corpo as Map<String, dynamic>;
+      expect(corpo['motivo'], 'Cliente ausente, interfone mudo');
+      // RF-E12: a hora em que aconteceu vai junto, para valer mesmo se chegar depois.
+      expect(DateTime.parse(corpo['ocorridaEm'] as String).isUtc, isTrue);
       expect(mensagemAoSair, 'Pedido devolvido à loja.');
       controller.dispose();
     });
 
-    testWidgets('sem rede ao concluir, avisa e mantem a corrida aberta', (tester) async {
+    testWidgets('RF-E12: sem rede ao concluir, guarda a conclusao e libera o entregador', (
+      tester,
+    ) async {
       api.responder = (c) => c.caminho.endsWith('/concluir') ? (503, null) : (200, corridaJson());
       localizacao.permissao = Permissao.bloqueada;
       await abrir(tester);
@@ -368,10 +473,32 @@ void main() {
       await tester.tap(find.text('Já entreguei'));
       await _assentar(tester);
 
-      expect(find.text('O serviço está indisponível no momento.'), findsOneWidget);
-      expect(find.text('Entrega #K7M2P9'), findsOneWidget);
+      expect(
+        mensagemAoSair,
+        'Entrega concluída sem internet. Vamos avisar a loja assim que a conexão voltar.',
+      );
+      expect(controller.guardadaParaEnviar, isTrue);
+      expect(controller.rastreador.ativo, isFalse);
+      expect(controller.pendencias.acoes.single.tipo.name, 'concluir');
+      controller.dispose();
+      await tester.pumpWidget(const SizedBox());
+    });
+
+    testWidgets('recusa da API ao concluir mantem a corrida aberta, com o motivo', (tester) async {
+      api.responder = (c) => c.caminho.endsWith('/concluir')
+          ? (409, {'message': 'Esta entrega nao esta mais em andamento.'})
+          : (200, corridaJson());
+      localizacao.permissao = Permissao.bloqueada;
+      await abrir(tester);
+
+      await tester.tap(find.byKey(const Key('concluir-longe')));
+      await _assentar(tester);
+      await tester.tap(find.text('Já entreguei'));
+      await _assentar(tester);
+
+      expect(find.text('Esta entrega nao esta mais em andamento.'), findsOneWidget);
       expect(mensagemAoSair, isNull);
-      expect(controller.corrida.emRota, isTrue);
+      expect(controller.pendencias.vazia, isTrue);
       controller.dispose();
       await tester.pumpWidget(const SizedBox());
     });

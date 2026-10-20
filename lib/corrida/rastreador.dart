@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/foundation.dart';
 
 import '../core/api_client.dart';
+import '../core/espera.dart';
 import '../core/geo.dart';
 import '../core/localizacao.dart';
 import 'filtro_gps.dart';
@@ -56,8 +57,9 @@ class EstadoRastreio {
 /// Envia a posicao do entregador durante a corrida — e so durante ela.
 ///
 /// Cada leitura passa pelo [FiltroGps] e, havendo rota, e encaixada na rua
-/// quando esta perto dela. As posicoes saem em lote, e o que nao foi enviado
-/// por falta de rede fica na fila para a proxima tentativa.
+/// quando esta perto dela. As posicoes saem em lote, de tempos em tempos
+/// conforme a distancia que falta (RNF-E05), e o que nao foi enviado por falta
+/// de rede fica na fila para a proxima tentativa (RF-E12).
 class Rastreador {
   Rastreador({
     required this.api,
@@ -67,8 +69,18 @@ class Rastreador {
     required this.destino,
   });
 
-  /// De quanto em quanto tempo o lote e enviado.
-  static const intervaloDeEnvio = Duration(seconds: 3);
+  /// RNF-E05: de quanto em quanto tempo o lote sai, pela distancia ate o
+  /// cliente. Perto dele, que esta olhando o mapa, sai mais vezes; longe, as
+  /// leituras se juntam em lotes maiores e o radio do celular acorda menos.
+  static const intervaloPerto = Duration(seconds: 3);
+  static const intervaloNoCaminho = Duration(seconds: 6);
+  static const intervaloLonge = Duration(seconds: 10);
+  static const double pertoM = 1000;
+  static const double longeM = 3000;
+
+  /// Sem rede, a espera entre tentativas dobra ate este teto. Fica bem abaixo
+  /// do minuto em que o mapa do cliente passa a avisar que o sinal caiu.
+  static const esperaMaxima = Duration(seconds: 30);
 
   /// Ate quantos metros da rota a posicao e puxada para cima dela.
   static const double raioDeEncaixeM = 35;
@@ -97,6 +109,8 @@ class Rastreador {
   final List<PosicaoCorrigida> _fila = [];
   StreamSubscription<Leitura>? _leituras;
   Timer? _envio;
+  final _espera = Espera(base: intervaloPerto, maximo: esperaMaxima);
+  Duration? _esperaAposFalha;
   bool _enviando = false;
   bool _buscandoRota = false;
   bool _encerrado = false;
@@ -104,6 +118,25 @@ class Rastreador {
   DateTime? _ultimaRotaEm;
 
   bool get ativo => _leituras != null;
+
+  /// Ultima vez que a API recebeu um lote. Enquanto for recente, a resposta do
+  /// lote ja diz se a corrida segue, e ninguem precisa perguntar de novo.
+  DateTime? ultimoContatoEm;
+
+  /// Intervalo de envio para quem esta a [distanciaM] do destino (nula quando
+  /// a posicao ou o destino nao sao conhecidos).
+  static Duration intervaloPara(double? distanciaM) {
+    if (distanciaM == null) return intervaloNoCaminho;
+    if (distanciaM <= pertoM) return intervaloPerto;
+    if (distanciaM <= longeM) return intervaloNoCaminho;
+    return intervaloLonge;
+  }
+
+  Duration get intervaloAtual {
+    final posicao = estado.value.posicao?.ponto;
+    final destino = this.destino;
+    return intervaloPara(posicao == null || destino == null ? null : distanciaM(posicao, destino));
+  }
 
   /// Comeca a rastrear se a localizacao estiver liberada. Nao pede permissao:
   /// isso e decisao da tela, que explica antes para que serve (RF-E11).
@@ -118,8 +151,24 @@ class Rastreador {
       onError: (Object _) =>
           estado.value = estado.value.copiar(situacao: SituacaoRastreio.semLocalizacao),
     );
-    _envio = Timer.periodic(intervaloDeEnvio, (_) => enviar());
+    api.conectado.addListener(_aoMudarConexao);
+    _agendar(intervaloAtual);
     estado.value = estado.value.copiar(situacao: SituacaoRastreio.ativo);
+  }
+
+  void _agendar(Duration espera) {
+    _envio?.cancel();
+    if (_encerrado) return;
+    _envio = Timer(espera, () async {
+      await enviar();
+      _agendar(_esperaAposFalha ?? intervaloAtual);
+    });
+  }
+
+  /// A rede voltou (outra chamada do app teve resposta): manda o que ficou
+  /// guardado agora, sem esperar o fim da espera.
+  void _aoMudarConexao() {
+    if (api.conectado.value && _esperaAposFalha != null && !_enviando) _agendar(Duration.zero);
   }
 
   @visibleForTesting
@@ -206,14 +255,20 @@ class Rastreador {
         ],
       });
       _removerEnviadas(lote.length);
+      _espera.zerar();
+      _esperaAposFalha = null;
+      ultimoContatoEm = DateTime.now();
       estado.value = estado.value.copiar(pendentes: _fila.length, semConexao: false);
       if (resposta is Map && resposta['rastreioAtivo'] == false) {
         await parar();
         aoEncerrarPelaLoja?.call();
       }
     } on ApiException catch (e) {
-      if (e.semConexao || (e.status ?? 0) >= 500 || e.status == 429) {
-        // Fica na fila para a proxima tentativa (RF-E12).
+      if (e.passageiro) {
+        // Fica na fila para a proxima tentativa (RF-E12), cada vez mais
+        // espacada. Com a API pedindo calma (429), espera o teto direto.
+        final espera = _espera.depoisDeFalhar();
+        _esperaAposFalha = e.status == 429 ? esperaMaxima : espera;
         estado.value = estado.value.copiar(semConexao: e.semConexao);
       } else if (e.status == 404) {
         await parar();
@@ -221,6 +276,8 @@ class Rastreador {
       } else {
         // Lote recusado como invalido: insistir nele travaria a fila.
         _removerEnviadas(lote.length);
+        _espera.zerar();
+        _esperaAposFalha = null;
       }
     } finally {
       _enviando = false;
@@ -234,6 +291,7 @@ class Rastreador {
     _encerrado = true;
     _envio?.cancel();
     _envio = null;
+    api.conectado.removeListener(_aoMudarConexao);
     // Cancelar ja corta as leituras na hora; nao ha por que esperar o aparelho
     // terminar de desligar o GPS para seguir.
     unawaited(_leituras?.cancel());

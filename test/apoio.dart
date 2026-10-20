@@ -28,16 +28,24 @@ class ApiFalsa {
   /// Devolve (status, corpo) para cada chamada.
   (int, Object?) Function(Chamada chamada) responder = (_) => (200, <String, dynamic>{});
 
+  /// Sem rede: a chamada nem chega ao servidor (fica registrada, para contar tentativas).
+  bool semRede = false;
+
   late final ApiClient cliente = ApiClient(
     baseUrl: 'http://api.teste',
     cliente: MockClient((requisicao) async {
       final chamada = Chamada(
         requisicao.method,
         requisicao.url.path,
-        requisicao.body.isEmpty ? null : jsonDecode(requisicao.body),
+        // Multipart (foto do comprovante) nao e JSON: fica so o registro da chamada.
+        requisicao.body.isEmpty ||
+                !(requisicao.headers['content-type'] ?? '').startsWith('application/json')
+            ? null
+            : jsonDecode(requisicao.body),
         requisicao.headers,
       );
       chamadas.add(chamada);
+      if (semRede) throw http.ClientException('sem rede', requisicao.url);
       final (status, corpo) = responder(chamada);
       return http.Response(
         corpo == null ? '' : jsonEncode(corpo),
