@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/foundation.dart';
 
 import '../auth/cofre.dart';
+import '../core/armazem.dart';
 import '../auth/sessao.dart';
 import '../core/api_client.dart';
 import '../core/geo.dart';
@@ -43,6 +44,7 @@ class Demo {
         ? ApiClient()
         : ApiClient(cliente: api!.cliente, baseUrl: 'http://demo');
     cofre = comApiFalsa ? CofreDemo() : CofreSeguro();
+    armazem = comApiFalsa ? ArmazemEmMemoria() : ArmazemSeguro();
     registro = RegistroDemo(gps);
   }
 
@@ -58,6 +60,7 @@ class Demo {
 
   final RotaService rotas = RotaServiceDemo();
   late final Cofre cofre;
+  late final Armazem armazem;
   late final LocalizacaoSimulada gps;
 
   /// Nula quando o app fala com a API de verdade.

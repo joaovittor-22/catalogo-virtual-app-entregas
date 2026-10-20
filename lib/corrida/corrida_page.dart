@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:url_launcher/url_launcher.dart';
@@ -8,6 +9,7 @@ import '../core/tema.dart';
 import '../dev/demo.dart';
 import '../dev/painel_demo.dart';
 import 'corrida_controller.dart';
+import 'dialogos.dart';
 import 'rastreador.dart';
 
 /// Entrega em andamento: detalhes do pedido, endereco completo, contato do
@@ -18,6 +20,10 @@ class CorridaPage extends StatefulWidget {
   const CorridaPage({super.key, required this.controller});
 
   final CorridaController controller;
+
+  /// Sem rede, a acao ficou guardada: o entregador ja pode seguir (RF-E12).
+  static String guardada(String feito) =>
+      '$feito sem internet. Vamos avisar a loja assim que a conexão voltar.';
 
   @override
   State<CorridaPage> createState() => _CorridaPageState();
@@ -115,35 +121,23 @@ class _CorridaPageState extends State<CorridaPage> {
     );
   }
 
+  /// RF-E08: sempre confirma, com a observacao opcional para a loja. Longe
+  /// do endereco (ou sem GPS), o aviso pede para conferir antes.
   Future<void> _concluir({required bool longe}) async {
-    if (longe && !await _confirmarLonge()) return;
-    await _executar(_c.concluir, 'Entrega concluída. Escolha a próxima.');
-  }
-
-  Future<bool> _confirmarLonge() async {
-    final distanciaM = _c.distanciaAoDestinoM;
-    final confirmou = await showDialog<bool>(
+    final observacao = await showDialog<String>(
       context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Concluir mesmo assim?'),
-        content: Text(
-          distanciaM == null
-              ? 'Não foi possível confirmar pelo GPS que você chegou ao endereço. '
-                    'Conclua só se o pedido já foi entregue.'
-              : 'Você ainda está a ${distancia(distanciaM)} do endereço. '
-                    'Conclua só se o pedido já foi entregue.',
-        ),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Voltar')),
-          FilledButton(
-            style: FilledButton.styleFrom(minimumSize: const Size(120, 48)),
-            onPressed: () => Navigator.pop(context, true),
-            child: const Text('Já entreguei'),
-          ),
-        ],
+      builder: (_) => DialogoDeConclusao(
+        numero: _c.corrida.numero,
+        clienteNome: _c.corrida.clienteNome,
+        longe: longe,
+        distanciaM: _c.distanciaAoDestinoM,
       ),
     );
-    return confirmou ?? false;
+    if (observacao == null || !mounted) return;
+    await _executar(
+      () => _c.concluir(observacao: observacao),
+      'Entrega concluída. Escolha a próxima.',
+    );
   }
 
   /// Foto opcional do comprovante de pagamento: camera ou galeria.
@@ -185,8 +179,19 @@ class _CorridaPageState extends State<CorridaPage> {
     }
     if (foto == null) return;
     try {
-      await _c.enviarComprovante(await foto.readAsBytes(), foto.name);
-      if (mounted) _avisar('Comprovante enviado.');
+      await _c.enviarComprovante(
+        await foto.readAsBytes(),
+        foto.name,
+        // Na web o caminho nao e um arquivo que de para ler de novo depois.
+        caminho: kIsWeb ? null : foto.path,
+      );
+      if (mounted) {
+        _avisar(
+          _c.comprovanteGuardado
+              ? 'Sem internet. O comprovante será enviado quando a conexão voltar.'
+              : 'Comprovante enviado.',
+        );
+      }
     } on ApiException catch (e) {
       if (mounted) _avisar(e.mensagem);
     }
@@ -204,18 +209,27 @@ class _CorridaPageState extends State<CorridaPage> {
   Future<void> _devolver() async {
     final motivo = await showDialog<String>(
       context: context,
-      builder: (_) => const _DialogoDeMotivo(),
+      builder: (_) => const DialogoDeMotivo(),
     );
     if (motivo == null) return;
-    await _executar(() => _c.devolver(motivo), 'Pedido devolvido à loja.');
+    await _executar(
+      () => _c.devolver(motivo),
+      'Pedido devolvido à loja.',
+      guardado: 'Devolução registrada',
+    );
   }
 
-  Future<void> _executar(Future<void> Function() acao, String aoTerminar) async {
+  Future<void> _executar(
+    Future<void> Function() acao,
+    String aoTerminar, {
+    String guardado = 'Entrega concluída',
+  }) async {
     try {
       await acao();
-      _sair(aoTerminar);
+      _sair(_c.guardadaParaEnviar ? CorridaPage.guardada(guardado) : aoTerminar);
     } on ApiException catch (e) {
-      // Rede caiu: nada se perde, e so tocar de novo.
+      // Recusa da API (a loja encerrou antes, por exemplo): a corrida segue
+      // aberta, com o motivo. Falta de rede nao chega aqui: fica guardada.
       if (mounted) _avisar(e.mensagem);
     }
   }
@@ -409,6 +423,7 @@ class _CartaoDoComprovante extends StatelessWidget {
     final foto = controller.fotoDoComprovante;
     final ocupado = controller.enviandoComprovante;
     final enviadoEm = corrida.comprovanteEm;
+    final temComprovante = controller.temComprovante;
     return Card(
       child: Padding(
         padding: const EdgeInsets.all(16),
@@ -416,7 +431,7 @@ class _CartaoDoComprovante extends StatelessWidget {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             const _Rotulo('Comprovante de pagamento (opcional)'),
-            if (!corrida.temComprovante)
+            if (!temComprovante)
               const Text(
                 'Se o cliente pagou na maquininha ou por Pix, fotografe o comprovante.',
                 style: TextStyle(color: Cores.apagado),
@@ -434,7 +449,9 @@ class _CartaoDoComprovante extends StatelessWidget {
                   const SizedBox(width: 12),
                   Expanded(
                     child: Text(
-                      enviadoEm == null
+                      controller.comprovanteGuardado
+                          ? 'Sem internet. A foto será enviada quando a conexão voltar.'
+                          : enviadoEm == null
                           ? 'Comprovante enviado.'
                           : 'Comprovante enviado às ${hora(enviadoEm)}.',
                       style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
@@ -454,10 +471,10 @@ class _CartaoDoComprovante extends StatelessWidget {
                             child: CircularProgressIndicator(strokeWidth: 2.5),
                           )
                         : const Icon(Icons.photo_camera_outlined),
-                    label: Text(corrida.temComprovante ? 'Trocar foto' : 'Enviar foto'),
+                    label: Text(temComprovante ? 'Trocar foto' : 'Enviar foto'),
                   ),
                 ),
-                if (corrida.temComprovante) ...[
+                if (temComprovante) ...[
                   const SizedBox(width: 8),
                   TextButton(onPressed: ocupado ? null : aoRemover, child: const Text('Remover')),
                 ],
@@ -466,48 +483,6 @@ class _CartaoDoComprovante extends StatelessWidget {
           ],
         ),
       ),
-    );
-  }
-}
-
-/// Pergunta por que a entrega nao foi feita. So fecha com um motivo escrito.
-class _DialogoDeMotivo extends StatefulWidget {
-  const _DialogoDeMotivo();
-
-  @override
-  State<_DialogoDeMotivo> createState() => _DialogoDeMotivoState();
-}
-
-class _DialogoDeMotivoState extends State<_DialogoDeMotivo> {
-  final _campo = TextEditingController();
-
-  @override
-  void dispose() {
-    _campo.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return AlertDialog(
-      title: const Text('Não consegui entregar'),
-      content: TextField(
-        controller: _campo,
-        autofocus: true,
-        maxLength: 500,
-        maxLines: 3,
-        decoration: const InputDecoration(hintText: 'O que aconteceu? Ex.: cliente ausente'),
-      ),
-      actions: [
-        TextButton(onPressed: () => Navigator.pop(context), child: const Text('Voltar')),
-        FilledButton(
-          style: FilledButton.styleFrom(minimumSize: const Size(120, 48)),
-          onPressed: () {
-            if (_campo.text.trim().isNotEmpty) Navigator.pop(context, _campo.text);
-          },
-          child: const Text('Devolver pedido'),
-        ),
-      ],
     );
   }
 }

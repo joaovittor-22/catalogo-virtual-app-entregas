@@ -1,18 +1,23 @@
 import 'package:flutter/foundation.dart';
 
 import '../core/api_client.dart';
+import '../core/armazem.dart';
 import 'cofre.dart';
 import 'sessao.dart';
 
 /// Estado de login do app.
 class AuthController extends ChangeNotifier {
-  AuthController(this._api, this._cofre) {
+  AuthController(this._api, this._cofre, {Armazem? armazem})
+    : armazem = armazem ?? ArmazemEmMemoria() {
     _api.aoPerderSessao = sair;
     _api.aoExigirTermos = _termosMudaram;
   }
 
   final ApiClient _api;
   final Cofre _cofre;
+
+  /// Fila, corrida e acoes por enviar guardadas no aparelho (ver [DadosLocais]).
+  final Armazem armazem;
 
   Sessao? _sessao;
   bool _carregando = true;
@@ -93,6 +98,15 @@ class AuthController extends ChangeNotifier {
         'Em outras lojas, o seu cadastro continua.';
     // Se a loja cadastrar de novo, o aceite é pedido outra vez.
     await _cofre.gravarEmpresaComAceite(null);
+    await sairDoAparelho();
+  }
+
+  /// Sair de propósito (botão Sair, conta excluída): o aparelho fica sem dado de cliente e sem
+  /// ação por enviar. Já a sessão que expira ([sair]) guarda tudo, para seguir depois de entrar
+  /// de novo.
+  Future<void> sairDoAparelho() async {
+    final dono = _sessao?.dono;
+    if (dono != null) await DadosLocais.apagarTudo(armazem, dono);
     await sair();
   }
 

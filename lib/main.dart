@@ -4,6 +4,7 @@ import 'app.dart';
 import 'auth/auth_controller.dart';
 import 'auth/cofre.dart';
 import 'core/api_client.dart';
+import 'core/armazem.dart';
 import 'core/config.dart';
 import 'core/localizacao.dart';
 import 'corrida/rota_service.dart';
@@ -13,7 +14,7 @@ Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   if (modoDemo) {
     final demo = Demo.iniciar();
-    final auth = AuthController(demo.apiClient, demo.cofre);
+    final auth = AuthController(demo.apiClient, demo.cofre, armazem: demo.armazem);
     await auth.restaurar();
     if (auth.sessao == null && loginDev.isNotEmpty) {
       final partes = loginDev.split(':');
@@ -33,7 +34,7 @@ Future<void> main() async {
     return;
   }
   final api = ApiClient();
-  final auth = AuthController(api, CofreSeguro());
+  final auth = AuthController(api, CofreSeguro(), armazem: ArmazemSeguro());
   await auth.restaurar();
   runApp(
     EntregadorApp(auth: auth, api: api, localizacao: LocalizacaoDoAparelho(), rotas: RotaService()),
